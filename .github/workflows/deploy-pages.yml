@@ -1,0 +1,64 @@
+name: Scrape and deploy GitHub Pages
+
+on:
+  schedule:
+    # GitHub schedules use UTC. This is 05:17 UTC every day.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "scrape_taz_gute_nachricht.py"
+      - ".github/workflows/deploy-pages.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Scrape articles and generate page
+        run: |
+          mkdir -p _site
+          python scrape_taz_gute_nachricht.py \
+            --output /tmp/taz_gute_nachricht.csv \
+            --html-output _site/index.html
+
+      - name: Disable Jekyll processing
+        run: touch _site/.nojekyll
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

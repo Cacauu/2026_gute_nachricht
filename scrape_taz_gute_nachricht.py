@@ -304,6 +304,7 @@ class Article:
     link: str = ""
     topline: str = ""
     category: str = ""
+    text: str = ""
 
 
 class TazSearchParser(HTMLParser):
@@ -408,6 +409,57 @@ class TazSearchParser(HTMLParser):
         )
 
 
+class TazArticleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.text = ""
+        self._in_json_ld = False
+        self._json_ld_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {k: v or "" for k, v in attrs}
+        if tag == "script" and attr.get("type") == "application/ld+json":
+            self._in_json_ld = True
+            self._json_ld_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._in_json_ld:
+            self._read_json_ld("".join(self._json_ld_parts))
+            self._in_json_ld = False
+            self._json_ld_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_json_ld:
+            self._json_ld_parts.append(data)
+
+    def _read_json_ld(self, raw_json: str) -> None:
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            return
+
+        for item in iter_json_ld_items(payload):
+            item_type = item.get("@type")
+            types = item_type if isinstance(item_type, list) else [item_type]
+            if "NewsArticle" not in types:
+                continue
+            article_body = item.get("articleBody")
+            if isinstance(article_body, str):
+                self.text = clean_text(article_body)
+                return
+
+
+def iter_json_ld_items(payload: object) -> Iterable[dict[str, object]]:
+    if isinstance(payload, dict):
+        if "@graph" in payload:
+            yield from iter_json_ld_items(payload["@graph"])
+        else:
+            yield payload
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from iter_json_ld_items(item)
+
+
 def clean_text(value: str) -> str:
     value = html.unescape(value).replace("\xa0", " ")
     return re.sub(r"\s+", " ", value).strip()
@@ -450,6 +502,25 @@ def keyword_matches(keyword: str, text: str) -> bool:
     return keyword in text
 
 
+def article_text_from_html(raw_html: str) -> str:
+    parser = TazArticleTextParser()
+    parser.feed(raw_html)
+    return parser.text
+
+
+def enrich_article_text(articles: Iterable[Article], delay: float) -> None:
+    articles = [article for article in articles if article.link]
+    total = len(articles)
+    for index, article in enumerate(articles, start=1):
+        print(f"Fetching article text {index}/{total}: {article.link}", file=sys.stderr)
+        if delay and index > 1:
+            time.sleep(delay)
+        try:
+            article.text = article_text_from_html(fetch(article.link))
+        except (HTTPError, URLError, TimeoutError) as exc:
+            print(f"Article text fetch failed for {article.link}: {exc}", file=sys.stderr)
+
+
 def dedupe_articles(articles: Iterable[Article]) -> list[Article]:
     seen: set[str] = set()
     unique: list[Article] = []
@@ -483,6 +554,7 @@ def scrape(start_url: str, delay: float = 0.5, max_pages: int | None = None) -> 
         articles.extend(parser.articles)
 
     unique = dedupe_articles(articles)
+    enrich_article_text(unique, delay=delay)
     for article in unique:
         article.category = classify_topic(article.title)
     return unique
@@ -490,7 +562,7 @@ def scrape(start_url: str, delay: float = 0.5, max_pages: int | None = None) -> 
 
 def write_csv(path: str, articles: Iterable[Article]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["date", "title", "author", "link", "category"])
+        writer = csv.DictWriter(handle, fieldnames=["date", "title", "author", "link", "category", "text"])
         writer.writeheader()
         for article in articles:
             writer.writerow(
@@ -500,6 +572,7 @@ def write_csv(path: str, articles: Iterable[Article]) -> None:
                     "author": article.author,
                     "link": article.link,
                     "category": article.category,
+                    "text": article.text,
                 }
             )
 
@@ -511,6 +584,7 @@ def article_to_dict(article: Article) -> dict[str, str]:
         "author": article.author,
         "link": article.link,
         "category": article.category,
+        "text": article.text,
     }
 
 
@@ -583,7 +657,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <body>
   <header><div class="wrap topbar"><div><h1>Gute Nachrichten aus taz zukunft</h1><p class="subtitle">Durchsuchbare Übersicht mit Themenfiltern und schnellen Statistiken.</p></div><div class="count" aria-live="polite"><strong id="visibleCount">0</strong><span id="totalCount">Einträge</span></div></div></header>
   <main class="wrap">
-    <section class="controls" aria-label="Suche und Aktionen"><input id="search" class="search" type="search" placeholder="Suchen nach Titel, Autorin oder Datum"><button id="reset" class="button" type="button">Zurücksetzen</button></section>
+    <section class="controls" aria-label="Suche und Aktionen"><input id="search" class="search" type="search" placeholder="Suchen nach Titel, Volltext, Autorin oder Datum"><button id="reset" class="button" type="button">Zurücksetzen</button></section>
     <nav id="filters" class="filters" aria-label="Kategorien"></nav>
     <section class="grid" aria-label="Statistische Übersicht">
       <article class="panel authors"><h2>Aktivste Autor:innen</h2><div id="authors" class="bars"></div></article>
@@ -601,14 +675,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     function init(){state.allRows=EMBEDDED_ROWS.map(normalizeRow).filter(row=>row.title);state.allRows.sort((a,b)=>b.dateObj-a.dateObj||collator.compare(a.title,b.title));renderFilters();bindControls();update()}
     function bindControls(){document.getElementById("search").addEventListener("input",event=>{state.search=event.target.value.trim().toLowerCase();update()});document.getElementById("reset").addEventListener("click",()=>{state.category="all";state.search="";document.getElementById("search").value="";update()})}
     function renderFilters(){const counts=countBy(state.allRows,row=>row.category);const categories=Object.keys(CATEGORY_LABELS).filter(category=>category==="all"||counts.get(category));document.getElementById("filters").innerHTML=categories.map(category=>{const count=category==="all"?state.allRows.length:counts.get(category);return `<button class="chip" type="button" data-category="${category}" aria-pressed="${category===state.category}">${CATEGORY_LABELS[category]} (${count})</button>`}).join("");document.querySelectorAll(".chip").forEach(button=>{button.addEventListener("click",()=>{state.category=button.dataset.category;update()})})}
-    function update(){state.visibleRows=state.allRows.filter(row=>{const categoryMatches=state.category==="all"||row.category===state.category;const haystack=`${row.date} ${row.title} ${row.author} ${labelFor(row.category)}`.toLowerCase();return categoryMatches&&(!state.search||haystack.includes(state.search))});document.querySelectorAll(".chip").forEach(button=>button.setAttribute("aria-pressed",String(button.dataset.category===state.category)));document.querySelector(".grid").classList.toggle("is-filtered",state.category!=="all");document.getElementById("visibleCount").textContent=state.visibleRows.length;document.getElementById("totalCount").textContent=`von ${state.allRows.length} Einträgen`;renderStats();renderTable()}
+    function update(){state.visibleRows=state.allRows.filter(row=>{const categoryMatches=state.category==="all"||row.category===state.category;const haystack=`${row.date} ${row.title} ${row.author} ${labelFor(row.category)} ${row.text}`.toLowerCase();return categoryMatches&&(!state.search||haystack.includes(state.search))});document.querySelectorAll(".chip").forEach(button=>button.setAttribute("aria-pressed",String(button.dataset.category===state.category)));document.querySelector(".grid").classList.toggle("is-filtered",state.category!=="all");document.getElementById("visibleCount").textContent=state.visibleRows.length;document.getElementById("totalCount").textContent=`von ${state.allRows.length} Einträgen`;renderStats();renderTable()}
     function renderStats(){renderBars("authors",topCounts(state.visibleRows,row=>row.author||"Ohne Angabe",8),"#c62828");renderBars("categories",topCounts(state.visibleRows,row=>labelFor(row.category),10),(_,label)=>colorForLabel(label));const latestDate=state.allRows.reduce((latest,row)=>row.dateObj>latest?row.dateObj:latest,new Date(0));renderBars("topics3",topCounts(rowsSince(state.visibleRows,latestDate,3),row=>labelFor(row.category),5),(_,label)=>colorForLabel(label));renderBars("topics12",topCounts(rowsSince(state.visibleRows,latestDate,12),row=>labelFor(row.category),5),(_,label)=>colorForLabel(label))}
     function renderTable(){const tbody=document.getElementById("rows");tbody.innerHTML=state.visibleRows.map(row=>`<tr><td class="muted">${dateFormatter.format(row.dateObj)}</td><td class="title-cell"><a href="${escapeAttr(row.link)}" target="_blank" rel="noopener">${escapeHtml(row.title)}</a></td><td>${escapeHtml(row.author||"Ohne Angabe")}</td><td><span class="tag">${labelFor(row.category)}</span></td></tr>`).join("");document.getElementById("empty").hidden=state.visibleRows.length>0}
     function renderBars(id,items,color){const container=document.getElementById(id);if(!items.length){container.innerHTML=`<div class="muted">Keine Daten</div>`;return}const max=Math.max(...items.map(item=>item.count));container.innerHTML=items.map(item=>{const width=Math.max(5,Math.round(item.count/max*100));const barColor=typeof color==="function"?color(item.key,item.label):color;return `<div class="bar-row"><div class="bar-label" title="${escapeAttr(item.label)}">${escapeHtml(item.label)}</div><div class="bar-track"><div class="bar-fill" style="--w:${width}%;--bar:${barColor}"></div></div><div class="bar-value">${item.count}</div></div>`}).join("")}
     function topCounts(rows,keyFn,limit){return[...countBy(rows,keyFn)].map(([label,count])=>({key:label,label,count})).sort((a,b)=>b.count-a.count||collator.compare(a.label,b.label)).slice(0,limit)}
     function countBy(rows,keyFn){const map=new Map();rows.forEach(row=>{const key=keyFn(row);map.set(key,(map.get(key)||0)+1)});return map}
     function rowsSince(rows,latestDate,months){const cutoff=new Date(latestDate);cutoff.setMonth(cutoff.getMonth()-months);return rows.filter(row=>row.dateObj>=cutoff)}
-    function normalizeRow(row){return{date:row.date,dateObj:parseGermanDate(row.date),title:row.title||"",author:row.author||"",link:row.link||"",category:row.category||"other"}}
+    function normalizeRow(row){return{date:row.date,dateObj:parseGermanDate(row.date),title:row.title||"",author:row.author||"",link:row.link||"",category:row.category||"other",text:row.text||""}}
     function parseGermanDate(value){const[day,month,year]=value.split(".").map(Number);return new Date(year,month-1,day)}
     function labelFor(category){return CATEGORY_LABELS[category]||category}
     function colorForLabel(label){const category=Object.entries(CATEGORY_LABELS).find(([,value])=>value===label)?.[0];return CATEGORY_COLORS[category]||"#73736b"}
