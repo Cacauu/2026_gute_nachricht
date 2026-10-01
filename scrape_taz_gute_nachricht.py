@@ -16,7 +16,9 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -356,7 +358,7 @@ class TazSearchParser(HTMLParser):
             self._current.link = urljoin(self.base_url, html.unescape(attr.get("href", "")))
         elif tag == "span" and "typo-r-topline" in classes:
             self._start_capture("topline")
-        elif tag == "span" and "headline" in classes:
+        elif tag == "span" and ("headline" in classes or "typo-r-head-small" in classes):
             self._start_capture("title")
         elif tag == "span" and "typo-r-name" in classes:
             self._start_capture("author")
@@ -630,6 +632,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-url", default=DEFAULT_START_URL)
     parser.add_argument("--output", default="taz_gute_nachricht.csv")
     parser.add_argument("--html-output", default="index.html")
+    parser.add_argument("--snapshot-dir", default="snapshots", help="Directory for full timestamped HTML snapshots (UTC).")
     parser.add_argument("--delay", type=float, default=0.5, help="Delay between page requests in seconds.")
     parser.add_argument("--max-pages", type=int, default=None, help="Optional cap for test runs.")
     return parser.parse_args()
@@ -643,10 +646,21 @@ def main() -> int:
         print(f"Scrape failed: {exc}", file=sys.stderr)
         return 1
 
+    if not articles or any(not article.title.strip() for article in articles):
+        print("Scrape failed: no articles or missing article titles; refusing to overwrite outputs.", file=sys.stderr)
+        return 1
+
     write_csv(args.output, articles)
     write_html(args.html_output, articles)
+    snapshot_dir = Path(args.snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    snapshot_path = snapshot_dir / f"index-{stamp}.html"
+    with snapshot_path.open("xb") as handle:
+        handle.write(Path(args.html_output).read_bytes())
     print(f"Wrote {len(articles)} rows to {args.output}", file=sys.stderr)
     print(f"Wrote self-contained dashboard to {args.html_output}", file=sys.stderr)
+    print(f"Saved full HTML snapshot to {snapshot_path}", file=sys.stderr)
     return 0
 
 
