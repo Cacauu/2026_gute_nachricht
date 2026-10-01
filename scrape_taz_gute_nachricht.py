@@ -589,14 +589,35 @@ def article_to_dict(article: Article) -> dict[str, str]:
 
 
 def write_html(path: str, articles: Iterable[Article]) -> None:
+    article_list = list(articles)
     rows_json = json.dumps(
-        [article_to_dict(article) for article in articles],
+        [article_to_dict(article) for article in article_list],
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    rendered = HTML_TEMPLATE.replace("__ROWS_JSON__", rows_json)
+    rendered = (
+        HTML_TEMPLATE.replace("__ROWS_JSON__", rows_json)
+        .replace("__INITIAL_ROWS__", render_initial_rows(article_list))
+    )
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(rendered)
+
+
+def render_initial_rows(articles: Iterable[Article]) -> str:
+    """Render article rows so the dashboard remains useful without JavaScript."""
+    rows = []
+    for article in articles:
+        date = html.escape(clean_date(article.date))
+        title = html.escape(article.title)
+        author = html.escape(article.author or "Ohne Angabe")
+        link = html.escape(article.link, quote=True)
+        category = html.escape(article.category or "other")
+        rows.append(
+            f'<tr><td class="muted">{date}</td><td class="title-cell">'
+            f'<a href="{link}" target="_blank" rel="noopener">{title}</a></td>'
+            f'<td>{author}</td><td><span class="tag">{category}</span></td></tr>'
+        )
+    return "".join(rows)
 
 
 def clean_date(value: str) -> str:
@@ -663,7 +684,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <article class="panel authors"><h2>Aktivste Autor:innen</h2><div id="authors" class="bars"></div></article>
       <article class="panel category-chart"><h2>Einträge je Kategorie</h2><div id="categories" class="bars"></div></article>
       <article class="panel recent"><h2>Häufigste Themen</h2><div class="recent-block"><p class="recent-title">Letzte 3 Monate</p><div id="topics3" class="bars"></div></div><div class="recent-block"><p class="recent-title">Letzte 12 Monate</p><div id="topics12" class="bars"></div></div></article>
-      <article class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Titel</th><th>Autor:in</th><th>Kategorie</th></tr></thead><tbody id="rows"></tbody></table><div id="empty" class="empty" hidden>Keine Einträge passen zu den aktuellen Filtern.</div></div></article>
+      <article class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Titel</th><th>Autor:in</th><th>Kategorie</th></tr></thead><tbody id="rows">__INITIAL_ROWS__</tbody></table><div id="empty" class="empty" hidden>Keine Einträge passen zu den aktuellen Filtern.</div></div></article>
     </section>
   </main>
   <script>
